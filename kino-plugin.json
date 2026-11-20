@@ -21,10 +21,11 @@
     "webtoons-static.pstatic.net"
   ],
   "entry": "plugin.js",
+  "icon": "icon.png",
   "screen": {
     "label": "WEBTOON",
     "labelEn": "WEBTOON",
-    "icon": "bookmark",
+    "iconFile": "icon.png",
     "menuOpens": "screen",
     "opensFrom": [
       "menu",

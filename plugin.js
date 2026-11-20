@@ -215,6 +215,8 @@ function parseEpisodios(html) {
     });
     if (salida.length >= 40) return false;
   });
+  // El sitio los lista del más reciente al más antiguo: aquí van del 1º al último.
+  salida.sort((a, b) => Number(a.n) - Number(b.n));
   return salida;
 }
 
@@ -438,7 +440,11 @@ const M = {
   pagina: 0,
   pendiente: false,    // ¿hay tareas de red para el route actual?
   fallos: {},          // clave -> { hasta, msg, intentos }
-  rev: 0
+  rev: 0,
+  ruta: "",            // clave de la ruta pintada (reinicia la barra de carga)
+  claves: "",          // tareas pendientes de la ruta (reinicia su espera)
+  prog: 0,             // valor actual de la barra de carga (monótono: nunca baja)
+  t0: 0                // cuándo empezó a esperar el lote de tareas actual
 };
 
 const MAX_INTENTOS = 3;
@@ -488,13 +494,16 @@ function tareasParaRuta(route) {
     for (let i = 0; i < SEMILLAS.length; i++) {
       const slug = SEMILLAS[i];
       const s = sget("i:" + slug);
-      if (!s || !s.items || !s.items.length) {
-        const t = tareaUtil("seccion:" + slug, { clave: "seccion:" + slug, tipo: "seccion", genero: slug });
-        if (t) fuera.push(t);
-        break; // una por ticke
-      }
+      if (s && s.items && s.items.length) continue;
+      const t = tareaUtil("seccion:" + slug, { clave: "seccion:" + slug, tipo: "seccion", genero: slug });
+      if (!t) continue; // rendida: que sigan cargando las demás secciones
+      fuera.push(t);
+      break; // una por ticke
     }
-    if (!fuera.length && !sget("gn:")) fuera.push({ clave: "seccion:" + SEMILLAS[0], tipo: "seccion", genero: SEMILLAS[0] });
+    if (!fuera.length && sget("gn:") === null) {
+      const t = tareaUtil("seccion:" + SEMILLAS[0], { clave: "seccion:" + SEMILLAS[0], tipo: "seccion", genero: SEMILLAS[0] });
+      if (t) fuera.push(t);
+    }
     if (!fuera.length && sget("pl:") === null) {
       const t = tareaUtil("progreso", { clave: "progreso", tipo: "progreso" });
       if (t) fuera.push(t);
@@ -560,7 +569,10 @@ async function tareaSeccion(t) {
   const s = parseSeccionGenero(html, t.genero);
   if (!s) throw new Error("Ese género no devolvió obras");
   sset("i:" + t.genero, s, TTL_SECCION);
+  // Lista real de géneros: si esta página no la trae, se anota un intento hecho
+  // ("gn:" = []) para no volver a pedirla en bucle; las etiquetas usan las semillas.
   if (s.generos && s.generos.length) sset("gn:", s.generos, TTL_SECCION);
+  else if (sget("gn:") === null) sset("gn:", [], TTL_SECCION);
 }
 
 async function traerHtmlLista(t, href) {
@@ -690,16 +702,17 @@ const TABS = [
   { value: "buscar", label: "Buscar", labelEn: "Search" }
 ];
 
-function esqueleto(n, forma, w, h) {
-  const hijos = [];
-  for (let i = 0; i < n; i++) {
-    hijos.push({ type: "Skeleton", shape: forma || "block", width: w || 160, height: h || 200 });
-  }
-  return hijos;
-}
-
-function filaEsqueleto(n) {
-  return { type: "Row", gap: 8, children: esqueleto(n) };
+// Barra de carga creciente (widget "progress"): nunca baja, arranca desde lo que
+// ya se cargó (base) y sigue creciendo mientras la vista espera su tarea, sin
+// marcar el 100% hasta que el dato llegue de verdad.
+function barraCarga(base, etiqueta, etiquetaEn) {
+  const b = Math.max(0, Math.min(1, Number(base) || 0));
+  const ahora = Date.now();
+  if (!M.t0) M.t0 = ahora;
+  const espera = Math.min(1, (ahora - M.t0) / 9000);
+  const v = Math.min(0.97, Math.max(M.prog || 0, b + (0.97 - b) * espera));
+  M.prog = v;
+  return { type: "LinearProgressIndicator", value: v, labelText: etiqueta, labelTextEn: etiquetaEn || etiqueta };
 }
 
 function tarjeta(item, opts) {
@@ -756,9 +769,17 @@ function chipsGeneros(generos) {
 function cuerpoInicio() {
   const hijos = [];
   const semillas = SEMILLAS;
-  const generos = sget("gn:") || semillas.map((s) => ({ slug: s, label: s.toUpperCase() }));
+  const gn = sget("gn:");
+  const generos = Array.isArray(gn) && gn.length ? gn : semillas.map((s) => ({ slug: s, label: s.toUpperCase() }));
 
-  // Seguir leyendo (capacidad progress).
+  const total = semillas.length;
+  let cargadas = 0;
+  semillas.forEach((slug) => {
+    const s = sget("i:" + slug);
+    if (s && s.items && s.items.length) cargadas++;
+  });
+
+  // Seguir leyendo (capacidad progress); si aún no está, su barra de carga.
   const pl = sget("pl:");
   if (Array.isArray(pl) && pl.length) {
     const items = pl.filter((x) => !x.done && x.t).slice(0, 10);
@@ -768,26 +789,38 @@ function cuerpoInicio() {
         poster: x.poster, title: x.titulo || x.t, t: x.t, genre: x.label
       }, { fijo: true, ruta: { event: "leer", arg: x.t + "|" + (x.e || "") + "|" + encodeURIComponent(x.src || "") } })));
     }
+  } else if (pl === null && cargadas >= total && !rendido("progreso")) {
+    hijos.push(barraCarga(1,
+      enEspera("progreso") ? "Reintentando tu progreso…" : "Cargando tu progreso…",
+      "Loading your progress…"));
   }
 
-  let faltan = 0;
+  // Cada sección: la cargada se pinta; la que falta enseña su barra de carga
+  // (crece con lo ya cargado) o su error, si ya se rindió.
+  let algunaRendida = false;
   semillas.forEach((slug) => {
     const s = sget("i:" + slug);
-    if (s && s.items && s.items.length) hijos.push(seccionGenero(s));
-    else {
-      faltan++;
-      hijos.push({ type: "Column", gap: 8, children: [
-        { type: "Skeleton", shape: "line", width: 160, height: 16 },
-        filaEsqueleto(3)
-      ] });
+    if (s && s.items && s.items.length) { hijos.push(seccionGenero(s)); return; }
+    const titulo = slug.replace(/_/g, " ").toUpperCase();
+    const clave = "seccion:" + slug;
+    const err = falloDe(clave);
+    const seccion = [{ type: "Text", text: titulo, style: "h4", bold: true }];
+    if (rendido(clave)) {
+      algunaRendida = true;
+      seccion.push({ type: "Text", text: "No se pudo cargar: " + (err ? err.msg : ""), color: "error", style: "caption" });
+    } else {
+      seccion.push(barraCarga(cargadas / total,
+        (err ? "Reintentando " : "Cargando ") + titulo + "… (" + cargadas + "/" + total + ")",
+        (err ? "Retrying " : "Loading ") + titulo + " (" + cargadas + "/" + total + ")"));
     }
+    hijos.push({ type: "Column", gap: 8, children: seccion });
   });
 
   hijos.push({ type: "Text", text: "Explorar géneros", style: "h4", bold: true });
   hijos.push(chipsGeneros(generos));
 
-  if (faltan && !hijos.length) {
-    hijos.push({ type: "Text", text: "Cargando WEBTOON…", color: "muted" });
+  if (algunaRendida) {
+    hijos.push({ type: "ElevatedButton", icon: "refresh", labelText: "Reintentar carga", onPressed: { event: "reintentar", arg: "" } });
   }
   hijos.push({ type: "SizedBox", height: 32 });
   return { type: "SingleChildScrollView", direction: "vertical", children: [{ type: "Column", gap: 16, children: hijos }] };
@@ -834,7 +867,7 @@ function tarjetaHistorial(h) {
 function cuerpoHistorial() {
   const arr = leerLista("hist");
   if (!arr.length) {
-    return { type: "emptyState", icon: "schedule" in {} ? "schedule" : "list", title: "Todavía no has leído nada", titleEn: "Nothing read yet", text: "Lo que leas aparecerá aquí con tu progreso." };
+    return { type: "emptyState", icon: "list", title: "Todavía no has leído nada", titleEn: "Nothing read yet", text: "Lo que leas aparecerá aquí con tu progreso." };
   }
   const filas = [];
   for (let i = 0; i < Math.min(arr.length, 30); i += 8) {
@@ -898,15 +931,17 @@ function vistaDetalle(params) {
   const t = String(params.t || "");
   const det = sget("d:" + t);
   if (!det) {
-    return scaffoldCon(
-      { type: "Column", gap: 12, children: [
-        { type: "Skeleton", shape: "block", width: 400, height: 240 },
-        { type: "Skeleton", shape: "line", width: 320, height: 24 },
-        { type: "Skeleton", shape: "line", width: 240, height: 16 },
-        { type: "Text", text: "Cargando la obra…", color: "muted" }
-      ] },
-      "WEBTOON"
-    );
+    const err = falloDe("detalle:" + t);
+    const cuerpo = rendido("detalle:" + t)
+      ? { type: "Column", gap: 12, children: [
+          { type: "Text", text: "No se pudo cargar: " + (err ? err.msg : ""), color: "error", style: "caption" },
+          { type: "ElevatedButton", icon: "refresh", labelText: "Reintentar", onPressed: { event: "reintentar", arg: "detalle:" + t } }
+        ] }
+      : { type: "Column", gap: 12, children: [
+          barraCarga(0, err ? "Reintentando la obra…" : "Cargando la obra…", err ? "Retrying the series…" : "Loading the series…"),
+          { type: "Text", text: "Cargando la obra…", color: "muted" }
+        ] };
+    return scaffoldCon(cuerpo, "WEBTOON");
   }
 
   const caps = capsActuales(t);
@@ -960,11 +995,19 @@ function vistaDetalle(params) {
     });
   }
 
-  // Los capítulos de la página que se está viendo; si aún no hay, los cargados (del más reciente al más antiguo).
+  // Al pedir otra página de capítulos, su barra de carga queda visible sobre la lista.
+  const pend = sget("pgpend:");
+  if (pend && pend.t === t && !rendido("caps:" + t + ":" + pend.p)) {
+    hijos.push(barraCarga(0.6, "Cargando la página " + pend.p + "…", "Loading page " + pend.p + "…"));
+  }
+
+  // Los capítulos de la página que se está viendo; si aún no hay, los cargados.
+  // Siempre del episodio 1 al último (el sitio los da al revés).
   const pgi = sget("pgitems:");
   let paginaCaps = null;
   if (pgi && pgi.t === t && pgi.items && pgi.items.length) paginaCaps = pgi.items;
-  else if (caps && caps.length) paginaCaps = caps.slice().sort((a, b) => Number(b.n) - Number(a.n));
+  else if (caps && caps.length) paginaCaps = caps;
+  if (paginaCaps) paginaCaps = paginaCaps.slice().sort((a, b) => Number(a.n) - Number(b.n));
 
   if (paginaCaps && paginaCaps.length) {
     hijos.push({
@@ -989,14 +1032,20 @@ function vistaDetalle(params) {
       ]
     });
   } else {
-    hijos.push({ type: "Column", gap: 8, children: filaEsqueleto(1).children });
+    if (!rendido("caps:" + t + ":1")) {
+      const errCaps = falloDe("caps:" + t + ":1");
+      hijos.push(barraCarga(0.5,
+        errCaps ? "Reintentando los capítulos…" : "Cargando los capítulos…",
+        errCaps ? "Retrying the episodes…" : "Loading the episodes…"));
+    }
     hijos.push({
       type: "ElevatedButton", icon: "list", labelText: "Ver todos los capítulos",
       onPressed: { event: "caps", arg: t + "|1" }
     });
   }
 
-  const err = falloDe("detalle:" + t) || falloDe("caps:" + t + ":1");
+  const err = falloDe("detalle:" + t) || falloDe("caps:" + t + ":1") ||
+    (pend && pend.t === t ? falloDe("caps:" + t + ":" + pend.p) : null);
   if (err) {
     hijos.push({
       type: "Column", gap: 8, children: [
@@ -1017,16 +1066,24 @@ function vistaGenero(params) {
   const g = String(params.g || SEMILLAS[0]);
   const s = sget("i:" + g);
   const etiqueta = (s && s.titulo) || g.replace(/_/g, " ").toUpperCase();
-  const generos = sget("gn:") || TODOS_SLUGS.map((x) => ({ slug: x, label: x.replace(/_/g, " ").toUpperCase() }));
+  const gn = sget("gn:");
+  const generos = Array.isArray(gn) && gn.length ? gn : TODOS_SLUGS.map((x) => ({ slug: x, label: x.replace(/_/g, " ").toUpperCase() }));
 
   if (!s) {
-    return scaffoldCon({
-      type: "Column", gap: 12, children: [
-        { type: "Skeleton", shape: "line", width: 200, height: 24 },
-        filaEsqueleto(3),
-        filaEsqueleto(3)
-      ]
-    }, etiqueta, { volver: true, cargando: true });
+    const err = falloDe("seccion:" + g);
+    const cuerpo = rendido("seccion:" + g)
+      ? { type: "Column", gap: 12, children: [
+          { type: "Text", text: etiqueta, style: "h3", bold: true },
+          { type: "Text", text: "No se pudo cargar: " + (err ? err.msg : ""), color: "error", style: "caption" },
+          { type: "ElevatedButton", icon: "refresh", labelText: "Reintentar", onPressed: { event: "reintentar", arg: "" } }
+        ] }
+      : { type: "Column", gap: 12, children: [
+          { type: "Text", text: etiqueta, style: "h3", bold: true },
+          barraCarga(0, err ? "Reintentando " + etiqueta + "…" : "Cargando " + etiqueta + "…",
+            err ? "Retrying " + etiqueta : "Loading " + etiqueta),
+          { type: "Text", text: "Cargando las obras del género…", color: "muted" }
+        ] };
+    return scaffoldCon(cuerpo, etiqueta, { volver: true, cargando: true });
   }
 
   const hijos = [
@@ -1066,12 +1123,18 @@ function vistaLector(params) {
   const v = sget("v:");
 
   if (!v || v.t !== t || v.e !== e) {
-    return scaffoldCon({
-      type: "Column", gap: 12, mainAxisAlignment: "center", crossAxisAlignment: "center", children: [
-        { type: "CircularProgressIndicator", text: "Abriendo el capítulo " + e + "…" },
-        { type: "Skeleton", shape: "block", width: 320, height: 400 }
-      ]
-    }, "Capítulo " + e, { volver: true, cargando: true });
+    const err = falloDe("capitulo:" + t + ":" + e);
+    const cuerpo = rendido("capitulo:" + t + ":" + e)
+      ? { type: "Column", gap: 12, children: [
+          { type: "Text", text: "No se pudo abrir: " + (err ? err.msg : ""), color: "error", style: "caption" },
+          { type: "ElevatedButton", icon: "refresh", labelText: "Reintentar", onPressed: { event: "reintentar", arg: "" } }
+        ] }
+      : { type: "Column", gap: 12, children: [
+          barraCarga(0, err ? "Reintentando el capítulo " + e + "…" : "Abriendo el capítulo " + e + "…",
+            err ? "Retrying episode " + e : "Opening episode " + e),
+          { type: "Text", text: "Descargando las páginas del episodio…", color: "muted" }
+        ] };
+    return scaffoldCon(cuerpo, "Capítulo " + e, { volver: true, cargando: true });
   }
 
   const det = sget("d:" + t);
@@ -1212,6 +1275,19 @@ export async function screen(ctx) {
   // la vista pide un temporizador "every" y un ticke ejecuta UNA tarea.
   const tareas = atrapar(() => tareasParaRuta(route)) || [];
   M.pendiente = tareas.length > 0;
+  // La barra de carga: se reinicia al cambiar de ruta o cuando ya no falta nada,
+  // y su reloj de espera arranca de nuevo cuando cambia el lote de tareas.
+  const claveRuta = nombre + "|" + JSON.stringify(route.params || {});
+  const claves = tareas.map((x) => x.clave).sort().join(",");
+  if (claveRuta !== M.ruta || !tareas.length) {
+    M.ruta = claveRuta;
+    M.claves = "";
+    M.prog = 0;
+    M.t0 = 0;
+  } else if (claves !== M.claves) {
+    M.claves = claves;
+    M.t0 = Date.now();
+  }
   let vista;
   if (nombre === "detail") vista = vistaDetalle(route.params || {});
   else if (nombre === "read") vista = vistaLector(route.params || {});
