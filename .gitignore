@@ -1,0 +1,7 @@
+# Probado con `node sdk/run.mjs` (lo escribe el kit al probar el plugin en local).
+.kino-cookies.json
+.kino-storage.json
+.kino-secrets.json
+.kino-shared.json
+.kino-notices.json
+sdk/config.json

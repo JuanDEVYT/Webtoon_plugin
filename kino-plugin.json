@@ -1,0 +1,34 @@
+{
+  "id": "webtoon",
+  "name": "WEBTOON",
+  "version": "1.0.0",
+  "description": "Lee webcómic de webtoons.com en Kino: Inicio por géneros, Biblioteca, Favoritos, Historial, Buscar, detalle de obra y lector vertical por capítulos con progreso de lectura.",
+  "author": "JuandreXter",
+  "creator": "JuandreXter",
+  "apiVersion": 22,
+  "capabilities": [
+    "screen",
+    "progress",
+    "shared"
+  ],
+  "categories": [
+    "manga"
+  ],
+  "hosts": [
+    "www.webtoons.com",
+    "webtoon-phinf.pstatic.net",
+    "swebtoon-phinf.pstatic.net",
+    "webtoons-static.pstatic.net"
+  ],
+  "entry": "plugin.js",
+  "screen": {
+    "label": "WEBTOON",
+    "labelEn": "WEBTOON",
+    "icon": "bookmark",
+    "menuOpens": "screen",
+    "opensFrom": [
+      "menu",
+      "settings"
+    ]
+  }
+}
